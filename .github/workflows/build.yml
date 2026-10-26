@@ -22,7 +22,35 @@ jobs:
       - name: Checkout project
         uses: actions/checkout@v4
 
+      - name: Find and extract ZIP
+        id: extract
+        run: |
+          echo "=== Szukam pliku ZIP ==="
+          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" -type f | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "BŁĄD: Nie znaleziono pliku .zip w głównym katalogu!"
+            ls -la
+            exit 1
+          fi
+          echo "Znaleziono ZIP: $ZIP_FILE"
+          
+          echo "=== Rozpakowuję ==="
+          unzip -q "$ZIP_FILE" -d extracted
+          
+          # Szukamy gradlew po rozpakowaniu
+          GRADLEW_PATH=$(find extracted -name "gradlew" -type f | head -n 1)
+          if [ -z "$GRADLEW_PATH" ]; then
+            echo "BŁĄD: Po rozpakowaniu nie znaleziono gradlew!"
+            find extracted -maxdepth 3 -type d
+            exit 1
+          fi
+          
+          PROJECT_DIR=$(dirname "$GRADLEW_PATH")
+          echo "Projekt znajduje się w: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+
       - name: Restore upstream source submodules
+        working-directory: ${{ steps.extract.outputs.project_dir }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -56,19 +84,21 @@ jobs:
           sudo apt-get install -y ninja-build
 
       - name: Build the unified debug APK
+        working-directory: ${{ steps.extract.outputs.project_dir }}
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace :app:assembleFossDebug
 
       - name: List built APKs
-        run: find app/build/outputs -name "*.apk" -type f
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: find app/build/outputs -name "*.apk" -type f || true
 
       - name: Upload single APK
         uses: actions/upload-artifact@v4
         with:
           name: Drive-Music-single-APK
           path: |
-            app/build/outputs/apk/**/*.apk
-            app/build/outputs/**/*.apk
+            ${{ steps.extract.outputs.project_dir }}/app/build/outputs/apk/**/*.apk
+            ${{ steps.extract.outputs.project_dir }}/app/build/outputs/**/*.apk
           if-no-files-found: error
           retention-days: 14
