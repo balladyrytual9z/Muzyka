@@ -3,61 +3,66 @@ name: Build Muzyka
 on:
 workflow_dispatch:
 push:
-branches: [main, master]
+branches:
+- main
+- master
 
 permissions:
 contents: read
 
-concurrency:
-group: muzyka-${{ github.ref }}
-cancel-in-progress: true
-
 jobs:
 build:
-name: Build Android APK
 runs-on: ubuntu-22.04
 timeout-minutes: 90
 
 steps:
-  - name: Checkout project
+  - name: Checkout repository
     uses: actions/checkout@v4
-  - name: Restore upstream sources
-    shell: bash
-    run: |
-      set -euxo pipefail
-      rm -rf media musikr/src/main/cpp/taglib
-      git clone --depth 1 --recurse-submodules https://github.com/OxygenCobalt/media.git media
-      git clone https://github.com/taglib/taglib.git musikr/src/main/cpp/taglib
-      git -C musikr/src/main/cpp/taglib checkout ee1931b
   - name: Set up Java
     uses: actions/setup-java@v4
     with:
       distribution: temurin
       java-version: '21'
       cache: gradle
-  - name: Set up Android SDK
-    uses: android-actions/setup-android@v3
-    with:
-      cmdline-tools-version: '12266719'
-      accept-android-sdk-licenses: true
-  - name: Install Android packages
+  - name: Install Android SDK
     shell: bash
     run: |
       set -euxo pipefail
-      sdkmanager --version
+      echo "ANDROID_HOME=$ANDROID_HOME"
+      echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
+      mkdir -p "$ANDROID_HOME/cmdline-tools"
+      curl -fL --retry 3 \
+        https://dl.google.com/android/repository/commandlinetools-linux-12266719_latest.zip \
+        -o /tmp/android-tools.zip
+      mkdir -p /tmp/android-tools
+      unzip -q /tmp/android-tools.zip -d /tmp/android-tools
+      rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+      mv /tmp/android-tools/cmdline-tools \
+        "$ANDROID_HOME/cmdline-tools/latest"
+      echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+      echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+      export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
       yes | sdkmanager --licenses || true
       sdkmanager --install \
+        "platform-tools" \
         "platforms;android-36" \
         "build-tools;36.0.0" \
         "ndk;28.2.13676358" \
         "cmake;3.22.1"
+  - name: Install Ninja
+    run: |
       sudo apt-get update
       sudo apt-get install -y ninja-build
-  - name: Build APK
+  - name: Show SDK configuration
+    run: |
+      set -euxo pipefail
+      sdkmanager --list_installed
+      java -version
+  - name: Build debug APK
     shell: bash
     run: |
       set -euxo pipefail
-      chmod +x gradlew
+      chmod +x ./gradlew
       ./gradlew --no-daemon --stacktrace :app:assembleFossDebug
   - name: Upload APK
     if: success()
