@@ -1,6 +1,6 @@
-name: Build Muzyka APK
+name: Build Android APK
 
-'on':
+on:
   workflow_dispatch:
   push:
     branches:
@@ -10,97 +10,164 @@ name: Build Muzyka APK
 permissions:
   contents: read
 
-concurrency:
-  group: muzyka-build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Build Android APK
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    name: Build Android application
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 21
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '17'
 
-      - name: Check project structure
+      - name: Extract ZIP source archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/android-source"
+
+          while IFS= read -r -d '' archive; do
+            name="$(basename "$archive" .zip)"
+            destination="$RUNNER_TEMP/android-source/$name"
+            mkdir -p "$destination"
+            echo "Rozpakowuję: $archive"
+            unzip -oq "$archive" -d "$destination"
+          done < <(
+            find . -maxdepth 3 -type f -iname '*.zip' \
+              -not -path './.git/*' -print0
+          )
+
+      - name: Locate Gradle projects
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Repository: $GITHUB_WORKSPACE"
-          ls -la
+          PROJECTS="$RUNNER_TEMP/gradle-projects.txt"
+          : > "$PROJECTS"
 
-          if [ ! -f "./gradlew" ]; then
-            echo "::error::Nie znaleziono gradlew w katalogu głównym repozytorium."
-            echo "Sprawdź, czy cała zawartość projektu została przesłana na GitHub."
-            find . -maxdepth 4 \( -name gradlew -o -name settings.gradle -o -name settings.gradle.kts \) -print
+          for root in "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source"; do
+            [[ -d "$root" ]] || continue
+
+            find "$root" \
+              -type d \( -name .git -o -name .gradle -o -name build \) -prune -o \
+              -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -print0 |
+            while IFS= read -r -d '' file; do
+              dirname "$file" >> "$PROJECTS"
+            done
+          done
+
+          sort -u "$PROJECTS" -o "$PROJECTS"
+
+          if [[ ! -s "$PROJECTS" ]]; then
+            echo "::error::Nie znaleziono projektu Gradle."
+            echo "Pliki repozytorium:"
+            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
+              -not -path '*/.git/*' | head -250
+            echo "Pliki rozpakowanych archiwów:"
+            find "$RUNNER_TEMP/android-source" -maxdepth 6 -type f \
+              | head -250 || true
             exit 1
           fi
 
-          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
-            echo "::error::Brakuje settings.gradle lub settings.gradle.kts w katalogu głównym."
-            find . -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -print
-            exit 1
-          fi
+          echo "Znalezione projekty:"
+          cat "$PROJECTS"
 
-          chmod +x ./gradlew
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK components
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${ANDROID_HOME:-}" ] || [ ! -d "$ANDROID_HOME" ]; then
-            echo "::error::ANDROID_HOME nie wskazuje katalogu Android SDK."
-            exit 1
-          fi
-
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
-
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "::error::Nie znaleziono sdkmanager w $ANDROID_HOME/cmdline-tools."
-            find "$ANDROID_HOME" -maxdepth 5 -type f -name sdkmanager -print || true
-            exit 1
-          fi
-
-          echo "Using sdkmanager: $SDKMANAGER"
-          "$SDKMANAGER" --version
-
-          yes | "$SDKMANAGER" --licenses || true
-
-          "$SDKMANAGER" --install \
+          sdkmanager --install \
             "platform-tools" \
             "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "cmake;3.22.1" \
-            "ndk;28.2.13676358"
+            "build-tools;35.0.0"
 
-      - name: Install Ninja
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build APKs
         shell: bash
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
+          set -uo pipefail
 
-      - name: Build Muzyka debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./gradlew --no-daemon --stacktrace :app:assembleFossDebug
+          PROJECTS="$RUNNER_TEMP/gradle-projects.txt"
+          OUTPUT="$RUNNER_TEMP/apk-output"
 
-      - name: Upload APK
-        if: success()
+          mkdir -p "$OUTPUT"
+          successful=0
+          failed=0
+          index=0
+
+          while IFS= read -r project; do
+            [[ -n "$project" ]] || continue
+
+            index=$((index + 1))
+            echo ""
+            echo "========== Projekt $index: $project =========="
+
+            if [[ -f "$project/gradlew" ]] &&
+               [[ -f "$project/gradle/wrapper/gradle-wrapper.jar" ]]; then
+              chmod +x "$project/gradlew"
+              GRADLE="$project/gradlew"
+            else
+              echo "Używam Gradle 8.9 z runnera."
+              GRADLE="gradle"
+            fi
+
+            if ! (cd "$project" && "$GRADLE" --no-daemon tasks --all >/dev/null); then
+              echo "::error::Gradle nie uruchomił się w: $project"
+              failed=1
+              continue
+            fi
+
+            if (cd "$project" && "$GRADLE" --no-daemon --stacktrace assembleDebug); then
+              while IFS= read -r -d '' apk; do
+                safe="$(basename "$project")"
+                mkdir -p "$OUTPUT/$safe"
+                cp "$apk" "$OUTPUT/$safe/"
+                echo "Znaleziono APK: $apk"
+                successful=$((successful + 1))
+              done < <(
+                find "$project" -type f \
+                  -path '*/build/outputs/apk/*.apk' -print0
+              )
+            else
+              echo "::error::Kompilacja nie powiodła się w: $project"
+              failed=1
+            fi
+          done < "$PROJECTS"
+
+          echo ""
+          echo "Wygenerowane pliki APK:"
+          find "$OUTPUT" -type f -name '*.apk' -print || true
+
+          if [[ "$successful" -eq 0 ]]; then
+            echo "::error::Nie wygenerowano żadnego APK. Sprawdź logi kompilacji."
+            exit 1
+          fi
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::warning::Niektóre projekty nie zbudowały się. Dostępne APK zostaną przesłane."
+          fi
+
+      - name: Upload APK artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Muzyka-APK
-          path: app/build/outputs/apk/foss/debug/*.apk
-          if-no-files-found: error
+          name: Muzyka-Android-APK
+          path: ${{ runner.temp }}/apk-output/**/*.apk
+          if-no-files-found: warn
           retention-days: 14
