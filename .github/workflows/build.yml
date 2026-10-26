@@ -1,212 +1,66 @@
-name: Build Android APK
+name: Build Drive Music (single APK)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 permissions:
   contents: read
 
+concurrency:
+  group: drive-music-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build Android APK
+    name: Compile unified app for Android 9+
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
     steps:
-      - name: Checkout repository
+      - name: Checkout project
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Restore upstream source submodules
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf media musikr/src/main/cpp/taglib
+          git clone --depth 1 --recurse-submodules https://github.com/OxygenCobalt/media.git media
+          git clone https://github.com/taglib/taglib.git musikr/src/main/cpp/taglib
+          git -C musikr/src/main/cpp/taglib checkout ee1931b
+
+      - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
+          cache: gradle
 
-      - name: Extract all source ZIP archives
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build dependencies
         shell: bash
         run: |
-          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;28.2.13676358' \
+            'cmake;3.22.1'
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
 
-          mkdir -p "$RUNNER_TEMP/android-source"
-
-          # Extract ZIP files recursively, including ZIPs inside ZIPs.
-          for round in 1 2 3; do
-            while IFS= read -r -d '' archive; do
-              hash="$(sha256sum "$archive" | cut -c1-16)"
-              destination="$RUNNER_TEMP/android-source/archive-$hash"
-
-              if [[ ! -f "$destination/.extracted" ]]; then
-                mkdir -p "$destination"
-                echo "Extracting $archive"
-                unzip -oq "$archive" -d "$destination"
-                touch "$destination/.extracted"
-              fi
-            done < <(
-              find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source" \
-                -type d \( -name .git -o -name build -o -name .gradle \) -prune -o \
-                -type f -iname '*.zip' -print0 2>/dev/null
-            )
-          done
-
-      - name: Find complete Gradle projects
-        id: locate
-        shell: bash
+      - name: Build the unified debug APK
         run: |
-          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleFossDebug
 
-          PROJECTS="$RUNNER_TEMP/gradle-projects.txt"
-          : > "$PROJECTS"
-
-          for root in "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source"; do
-            [[ -d "$root" ]] || continue
-
-            while IFS= read -r -d '' settings; do
-              project="$(dirname "$settings")"
-
-              # Skip projects with missing included Gradle builds.
-              missing=0
-              while IFS= read -r include_path; do
-                [[ -n "$include_path" ]] || continue
-                if [[ ! -d "$project/$include_path" ]]; then
-                  echo "Incomplete project: $project"
-                  echo "Missing included build: $project/$include_path"
-                  missing=1
-                fi
-              done < <(
-                sed -nE \
-                  "s/.*includeBuild\\(['\"]([^'\"]+)['\"]\\).*/\\1/p" \
-                  "$settings"
-              )
-
-              if [[ "$missing" -eq 0 ]]; then
-                printf '%s\n' "$project" >> "$PROJECTS"
-              fi
-            done < <(
-              find "$root" \
-                -type d \( -name .git -o -name build -o -name .gradle \) -prune -o \
-                -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
-                -print0
-            )
-          done
-
-          sort -u "$PROJECTS" -o "$PROJECTS"
-
-          if [[ ! -s "$PROJECTS" ]]; then
-            echo "::error::No complete Gradle project found."
-            echo "The source archive appears incomplete or is missing required build-logic files."
-            echo "Files named build-logic-settings:"
-            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source" \
-              -type d -name build-logic-settings -print || true
-            echo "Gradle settings files:"
-            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source" \
-              -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
-              -print || true
-            echo "Repository files:"
-            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
-              -not -path '*/.git/*' | head -250
-            exit 1
-          fi
-
-          echo "Complete projects found:"
-          cat "$PROJECTS"
-
-      - name: Configure Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-
-          if [[ ! -d "$SDK" ]]; then
-            echo "::error::Android SDK not found at $SDK"
-            exit 1
-          fi
-
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-
-          echo "Installed SDK platforms:"
-          ls -la "$SDK/platforms" || true
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Build Android APK
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          PROJECTS="$RUNNER_TEMP/gradle-projects.txt"
-          OUTPUT="$RUNNER_TEMP/apk-output"
-
-          mkdir -p "$OUTPUT"
-          success=0
-          failure=0
-
-          while IFS= read -r project; do
-            [[ -n "$project" ]] || continue
-
-            echo ""
-            echo "========================================"
-            echo "Building: $project"
-            echo "========================================"
-
-            if [[ -f "$project/gradlew" ]] && \
-               [[ -f "$project/gradle/wrapper/gradle-wrapper.jar" ]]; then
-              chmod +x "$project/gradlew"
-              GRADLE="$project/gradlew"
-            else
-              GRADLE="gradle"
-            fi
-
-            if ! (cd "$project" && "$GRADLE" --no-daemon --stacktrace assembleDebug); then
-              echo "::error::Build failed: $project"
-              failure=1
-              continue
-            fi
-
-            count=0
-            while IFS= read -r -d '' apk; do
-              name="$(basename "$project")"
-              mkdir -p "$OUTPUT/$name"
-              cp "$apk" "$OUTPUT/$name/"
-              echo "APK created: $apk"
-              count=$((count + 1))
-              success=$((success + 1))
-            done < <(
-              find "$project" -type f \
-                -path '*/build/outputs/apk/*.apk' -print0
-            )
-
-            if [[ "$count" -eq 0 ]]; then
-              echo "::warning::Build succeeded but no APK was found in $project"
-            fi
-          done < "$PROJECTS"
-
-          echo ""
-          echo "Generated APKs:"
-          find "$OUTPUT" -type f -name '*.apk' -print || true
-
-          if [[ "$success" -eq 0 ]]; then
-            echo "::error::No APK was generated."
-            exit 1
-          fi
-
-          if [[ "$failure" -ne 0 ]]; then
-            echo "::warning::At least one project failed to build."
-          fi
-
-      - name: Upload APK
-        if: always()
+      - name: Upload single APK
         uses: actions/upload-artifact@v4
         with:
-          name: Android-APK
-          path: ${{ runner.temp }}/apk-output/**/*.apk
-          if-no-files-found: warn
+          name: Drive-Music-single-APK
+          path: app/build/outputs/apk/foss/debug/*.apk
+          if-no-files-found: error
           retention-days: 14
