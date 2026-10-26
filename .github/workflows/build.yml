@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Android application
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -25,24 +25,34 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract ZIP source archives
+      - name: Extract all source ZIP archives
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/android-source"
 
-          while IFS= read -r -d '' archive; do
-            name="$(basename "$archive" .zip)"
-            destination="$RUNNER_TEMP/android-source/$name"
-            mkdir -p "$destination"
-            echo "Extracting: $archive"
-            unzip -oq "$archive" -d "$destination"
-          done < <(
-            find . -maxdepth 3 -type f -iname '*.zip' \
-              -not -path './.git/*' -print0
-          )
+          # Extract ZIP files recursively, including ZIPs inside ZIPs.
+          for round in 1 2 3; do
+            while IFS= read -r -d '' archive; do
+              hash="$(sha256sum "$archive" | cut -c1-16)"
+              destination="$RUNNER_TEMP/android-source/archive-$hash"
 
-      - name: Locate Gradle projects
+              if [[ ! -f "$destination/.extracted" ]]; then
+                mkdir -p "$destination"
+                echo "Extracting $archive"
+                unzip -oq "$archive" -d "$destination"
+                touch "$destination/.extracted"
+              fi
+            done < <(
+              find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source" \
+                -type d \( -name .git -o -name build -o -name .gradle \) -prune -o \
+                -type f -iname '*.zip' -print0 2>/dev/null
+            )
+          done
+
+      - name: Find complete Gradle projects
+        id: locate
         shell: bash
         run: |
           set -euo pipefail
@@ -53,32 +63,57 @@ jobs:
           for root in "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source"; do
             [[ -d "$root" ]] || continue
 
-            find "$root" \
-              -type d \( -name .git -o -name .gradle -o -name build \) -prune -o \
-              -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
-              -print0 |
-            while IFS= read -r -d '' file; do
-              dirname "$file" >> "$PROJECTS"
-            done
+            while IFS= read -r -d '' settings; do
+              project="$(dirname "$settings")"
+
+              # Skip projects with missing included Gradle builds.
+              missing=0
+              while IFS= read -r include_path; do
+                [[ -n "$include_path" ]] || continue
+                if [[ ! -d "$project/$include_path" ]]; then
+                  echo "Incomplete project: $project"
+                  echo "Missing included build: $project/$include_path"
+                  missing=1
+                fi
+              done < <(
+                sed -nE \
+                  "s/.*includeBuild\\(['\"]([^'\"]+)['\"]\\).*/\\1/p" \
+                  "$settings"
+              )
+
+              if [[ "$missing" -eq 0 ]]; then
+                printf '%s\n' "$project" >> "$PROJECTS"
+              fi
+            done < <(
+              find "$root" \
+                -type d \( -name .git -o -name build -o -name .gradle \) -prune -o \
+                -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+                -print0
+            )
           done
 
           sort -u "$PROJECTS" -o "$PROJECTS"
 
           if [[ ! -s "$PROJECTS" ]]; then
-            echo "::error::No Gradle project found."
+            echo "::error::No complete Gradle project found."
+            echo "The source archive appears incomplete or is missing required build-logic files."
+            echo "Files named build-logic-settings:"
+            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source" \
+              -type d -name build-logic-settings -print || true
+            echo "Gradle settings files:"
+            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/android-source" \
+              -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -print || true
             echo "Repository files:"
             find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
               -not -path '*/.git/*' | head -250
-            echo "Extracted ZIP files:"
-            find "$RUNNER_TEMP/android-source" -maxdepth 6 -type f \
-              | head -250 || true
             exit 1
           fi
 
-          echo "Found Gradle projects:"
+          echo "Complete projects found:"
           cat "$PROJECTS"
 
-      - name: Configure preinstalled Android SDK
+      - name: Configure Android SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -86,7 +121,7 @@ jobs:
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
           if [[ ! -d "$SDK" ]]; then
-            echo "::error::Android SDK not found: $SDK"
+            echo "::error::Android SDK not found at $SDK"
             exit 1
           fi
 
@@ -94,25 +129,15 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
 
-          echo "Installed Android platforms:"
+          echo "Installed SDK platforms:"
           ls -la "$SDK/platforms" || true
-
-          echo "Installed Android build tools:"
-          ls -la "$SDK/build-tools" || true
-
-          if [[ ! -d "$SDK/platforms/android-35" ]] && \
-             [[ ! -d "$SDK/platforms/android-34" ]] && \
-             [[ ! -d "$SDK/platforms/android-33" ]]; then
-            echo "::error::No Android platform 33, 34 or 35 is preinstalled."
-            exit 1
-          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Build APKs
+      - name: Build Android APK
         shell: bash
         run: |
           set -uo pipefail
@@ -121,16 +146,16 @@ jobs:
           OUTPUT="$RUNNER_TEMP/apk-output"
 
           mkdir -p "$OUTPUT"
-          successful=0
-          failed=0
-          index=0
+          success=0
+          failure=0
 
           while IFS= read -r project; do
             [[ -n "$project" ]] || continue
 
-            index=$((index + 1))
             echo ""
-            echo "========== Project $index: $project =========="
+            echo "========================================"
+            echo "Building: $project"
+            echo "========================================"
 
             if [[ -f "$project/gradlew" ]] && \
                [[ -f "$project/gradle/wrapper/gradle-wrapper.jar" ]]; then
@@ -138,50 +163,50 @@ jobs:
               GRADLE="$project/gradlew"
             else
               GRADLE="gradle"
-              echo "Using installed Gradle."
             fi
 
-            if ! (cd "$project" && "$GRADLE" --no-daemon tasks --all >/dev/null); then
-              echo "::error::Gradle could not configure project: $project"
-              failed=1
+            if ! (cd "$project" && "$GRADLE" --no-daemon --stacktrace assembleDebug); then
+              echo "::error::Build failed: $project"
+              failure=1
               continue
             fi
 
-            if (cd "$project" && "$GRADLE" --no-daemon --stacktrace assembleDebug); then
-              while IFS= read -r -d '' apk; do
-                safe="$(basename "$project")"
-                mkdir -p "$OUTPUT/$safe"
-                cp "$apk" "$OUTPUT/$safe/"
-                echo "APK generated: $apk"
-                successful=$((successful + 1))
-              done < <(
-                find "$project" -type f \
-                  -path '*/build/outputs/apk/*.apk' -print0
-              )
-            else
-              echo "::error::Build failed: $project"
-              failed=1
+            count=0
+            while IFS= read -r -d '' apk; do
+              name="$(basename "$project")"
+              mkdir -p "$OUTPUT/$name"
+              cp "$apk" "$OUTPUT/$name/"
+              echo "APK created: $apk"
+              count=$((count + 1))
+              success=$((success + 1))
+            done < <(
+              find "$project" -type f \
+                -path '*/build/outputs/apk/*.apk' -print0
+            )
+
+            if [[ "$count" -eq 0 ]]; then
+              echo "::warning::Build succeeded but no APK was found in $project"
             fi
           done < "$PROJECTS"
 
           echo ""
-          echo "Generated APK files:"
+          echo "Generated APKs:"
           find "$OUTPUT" -type f -name '*.apk' -print || true
 
-          if [[ "$successful" -eq 0 ]]; then
-            echo "::error::No APK was generated. Review the build log above."
+          if [[ "$success" -eq 0 ]]; then
+            echo "::error::No APK was generated."
             exit 1
           fi
 
-          if [[ "$failed" -ne 0 ]]; then
-            echo "::warning::Some projects failed, but generated APKs will be uploaded."
+          if [[ "$failure" -ne 0 ]]; then
+            echo "::warning::At least one project failed to build."
           fi
 
-      - name: Upload APK artifacts
+      - name: Upload APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Muzyka-Android-APK
+          name: Android-APK
           path: ${{ runner.temp }}/apk-output/**/*.apk
           if-no-files-found: warn
           retention-days: 14
