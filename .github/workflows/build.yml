@@ -28,26 +28,31 @@ jobs:
           echo "=== Szukam pliku ZIP ==="
           ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" -type f | head -n 1)
           if [ -z "$ZIP_FILE" ]; then
-            echo "BŁĄD: Nie znaleziono pliku .zip w głównym katalogu!"
+            echo "BŁĄD: Nie znaleziono pliku .zip!"
             ls -la
             exit 1
           fi
           echo "Znaleziono ZIP: $ZIP_FILE"
           
-          echo "=== Rozpakowuję ==="
           unzip -q "$ZIP_FILE" -d extracted
           
-          # Szukamy gradlew po rozpakowaniu
           GRADLEW_PATH=$(find extracted -name "gradlew" -type f | head -n 1)
           if [ -z "$GRADLEW_PATH" ]; then
-            echo "BŁĄD: Po rozpakowaniu nie znaleziono gradlew!"
-            find extracted -maxdepth 3 -type d
+            echo "BŁĄD: Nie znaleziono gradlew po rozpakowaniu!"
             exit 1
           fi
           
           PROJECT_DIR=$(dirname "$GRADLEW_PATH")
-          echo "Projekt znajduje się w: $PROJECT_DIR"
+          echo "Projekt w: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+
+      - name: Fix Kotlin plugin for AGP 9
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: |
+          # Usuwamy stary plugin, który AGP 9 już nie akceptuje
+          sed -i "/id 'org.jetbrains.kotlin.android'/d" downloader/build.gradle
+          echo "Usunięto stary plugin z downloader/build.gradle"
+          head -15 downloader/build.gradle
 
       - name: Restore upstream source submodules
         working-directory: ${{ steps.extract.outputs.project_dir }}
