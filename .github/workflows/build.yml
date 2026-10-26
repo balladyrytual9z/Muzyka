@@ -22,29 +22,28 @@ jobs:
       - name: Checkout project
         uses: actions/checkout@v4
 
-      # 1. NAJPIERW JAVA - wymagana przez sdkmanager i gradlew
+      # 1. Konfiguracja Java 21
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      # 2. KONFIGURACJA ANDROID SDK I NARZĘDZI NATIVNYCH
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # 2. Używamy wbudowanego w runner Android SDK zamiast wadliwej akcji setup-android
       - name: Install required Android packages and NDK
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build
+
+          export ANDROID_HOME="/usr/local/lib/android/sdk"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+
+          # Akceptacja licencji
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          
-          # Instalacja platform i build-tools (zabezpieczenie na API 35/36)
+
+          # Instalacja wymaganych komponentów
           sdkmanager "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" || true
-          sdkmanager "platforms;android-36" || true
-          
-          # Instalacja NDK (jeśli 28.2 nie jest dostępna, pobiera stabilną wersję)
           sdkmanager "ndk;28.2.13676358" || sdkmanager "ndk;26.1.10909125" || true
 
       - name: Find and extract ZIP
@@ -63,7 +62,7 @@ jobs:
           
           GRADLEW_PATH=$(find extracted -name "gradlew" -type f | head -n 1)
           if [ -z "$GRADLEW_PATH" ]; then
-            echo "BŁĄD: Nie znaleziono gradlew wewnątrz wypakowanego ZIPa!"
+            echo "BŁĄD: Nie znaleziono gradlew wewnątrz archiwum!"
             find extracted -maxdepth 3
             exit 1
           fi
@@ -81,8 +80,6 @@ jobs:
             sed -i "/androidResources { generateLocaleConfig true }/d" downloader/build.gradle || true
             echo "=== Po poprawkach w downloader/build.gradle ==="
             head -45 downloader/build.gradle
-          else
-            echo "Plik downloader/build.gradle nie istnieje, pomijam."
           fi
 
       - name: Restore upstream source submodules
@@ -102,10 +99,9 @@ jobs:
       - name: Build the unified debug APK
         working-directory: ${{ steps.extract.outputs.project_dir }}
         env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
           chmod +x gradlew
-          # Próba budowy zadania :app:assembleFossDebug
           ./gradlew --no-daemon --stacktrace :app:assembleFossDebug || ./gradlew --no-daemon --stacktrace assembleDebug
 
       - name: List built APKs
