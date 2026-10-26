@@ -49,10 +49,13 @@ jobs:
       - name: Fix downloader for AGP 9
         working-directory: ${{ steps.extract.outputs.project_dir }}
         run: |
+          # Usuwamy problematyczne rzeczy
           sed -i "/id 'org.jetbrains.kotlin.android'/d" downloader/build.gradle
           sed -i "/kotlinOptions { jvmTarget = '17' }/d" downloader/build.gradle
-          echo "=== Po poprawkach ==="
-          head -40 downloader/build.gradle
+          sed -i "/androidResources { generateLocaleConfig true }/d" downloader/build.gradle
+          
+          echo "=== Po poprawkach (początek downloader/build.gradle) ==="
+          head -45 downloader/build.gradle
 
       - name: Restore upstream source submodules
         working-directory: ${{ steps.extract.outputs.project_dir }}
