@@ -60,8 +60,8 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace :app:assembleFossDebug
 
-      - name: List APK files (debug)
-        run: find app/build/outputs -name "*.apk" -type f || true
+      - name: List built APKs
+        run: find app/build/outputs -name "*.apk" -type f
 
       - name: Upload single APK
         uses: actions/upload-artifact@v4
